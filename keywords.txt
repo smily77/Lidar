@@ -1,0 +1,67 @@
+#######################################
+# Syntax Coloring Map For RPLidar
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+RPLidar	KEYWORD1
+RPLidarMeasurement	KEYWORD1
+RPLidarDeviceInfo	KEYWORD1
+RPLidarHealth	KEYWORD1
+RPLidarResponseDescriptor	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+stop	KEYWORD2
+reset	KEYWORD2
+startScan	KEYWORD2
+startExpressScan	KEYWORD2
+forceScan	KEYWORD2
+getDeviceInfo	KEYWORD2
+getHealth	KEYWORD2
+getSampleRate	KEYWORD2
+waitPoint	KEYWORD2
+readMeasurement	KEYWORD2
+readFast	KEYWORD2
+readRawMeasurement	KEYWORD2
+sendCommand	KEYWORD2
+readResponse	KEYWORD2
+flush	KEYWORD2
+isConnected	KEYWORD2
+getDefaultBaudRate	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+RPLIDAR_CMD_STOP	LITERAL1
+RPLIDAR_CMD_RESET	LITERAL1
+RPLIDAR_CMD_SCAN	LITERAL1
+RPLIDAR_CMD_EXPRESS_SCAN	LITERAL1
+RPLIDAR_CMD_FORCE_SCAN	LITERAL1
+RPLIDAR_CMD_GET_INFO	LITERAL1
+RPLIDAR_CMD_GET_HEALTH	LITERAL1
+RPLIDAR_CMD_GET_SAMPLERATE	LITERAL1
+RPLIDAR_CMD_GET_LIDAR_CONF	LITERAL1
+
+RPLIDAR_SCAN_MODE_STANDARD	LITERAL1
+RPLIDAR_SCAN_MODE_EXPRESS	LITERAL1
+RPLIDAR_SCAN_MODE_BOOST	LITERAL1
+RPLIDAR_SCAN_MODE_SENSITIVITY	LITERAL1
+RPLIDAR_SCAN_MODE_STABILITY	LITERAL1
+
+RPLIDAR_STATUS_OK	LITERAL1
+RPLIDAR_STATUS_WARNING	LITERAL1
+RPLIDAR_STATUS_ERROR	LITERAL1
+
+RPLIDAR_BAUD_A1M	LITERAL1
+RPLIDAR_BAUD_C1	LITERAL1
+RPLIDAR_BAUD_C3	LITERAL1
+RPLIDAR_BAUD_S2	LITERAL1
+RPLIDAR_BAUD_S2L	LITERAL1
+RPLIDAR_BAUD_S3	LITERAL1
