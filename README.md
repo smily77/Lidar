@@ -2,24 +2,67 @@
 
 Eine umfassende Arduino-Bibliothek für Slamtec RPLidar Laserscanner mit seriellem Interface.
 
+## Status / getestet
+
+- **Getestet:** RPLIDAR **C1** an **ESP32-S3** (Standard-Scan, 460800 Baud).
+- Protokoll-korrekt implementiert: Standard-Scan, Geräte-Info/Health, Sample-Rate.
+- **Express-Scan ist NICHT implementiert** (`startExpressScan()` gibt absichtlich
+  `false` zurück) — siehe Hinweis weiter unten.
+- `GET_LIDAR_CONF` (0x84) ist nur als Konstante vorhanden, keine High-Level-API.
+
 ## Unterstützte Modelle
 
-- **A-Serie**: A1M, A2M6, A2M8, A2M12, A3
-- **C-Serie**: C1, C3
-- **S-Serie**: S2, S2L, S3
-
-Alle Modelle mit seriellem/USB-Interface werden unterstützt.
+Das Standard-Scan-Protokoll ist bei A-, C- und S-Serie gleich; die Bibliothek
+sollte daher mit A1M/A2/A3, C1/C3 und S2/S2L/S3 im **Standard-Scan** funktionieren.
+Verifiziert wurde bisher nur der C1 (siehe oben). Modelle, die zwingend Express-Scan
+brauchen, werden derzeit nicht unterstützt.
 
 ## Features
 
-- ✅ Alle Standard-RPLidar-Befehle implementiert
-- ✅ **Ultra-optimierte Datenauslesung** für S2L (bis zu 32.000 Samples/Sekunde)
-- ✅ Standard Scan und Express Scan Modi
-- ✅ Geräteinformationen und Gesundheitsstatus
-- ✅ Benutzerdefinierte Befehle möglich
-- ✅ Minimal Overhead beim Datenauslesen (nur Distanz und Winkel)
-- ✅ Optimiert für ESP32 mit hohen Datenraten
-- ✅ Ausführliche Beispiele
+- ✅ Standard-Scan mit Byte-Stream-**Resynchronisierung** (robuste Ausrichtung)
+- ✅ Geräteinformationen, Gesundheitsstatus, Sample-Rate (mit Descriptor-Prüfung)
+- ✅ Benutzerdefinierte Befehle (`sendCommand`/`readResponse`)
+- ✅ Reiner, host-testbarer Node-Parser (`RPLidarParser.h`, siehe `test/`)
+- ✅ Ohne RTTI baubar (`-fno-rtti`) — läuft auf ESP32
+- ⛔ Express-Scan: **nicht implementiert**
+
+## Behobene Probleme (1.1.0)
+
+Diese Version behebt mehrere Protokoll- und Robustheitsfehler, durch die der
+C1 an ESP32 keine bzw. fehlerhafte Daten lieferte:
+
+- **`begin()` startet die UART nicht mehr ungewollt neu.** `begin(Stream&)`
+  *bindet* nur noch den bereits konfigurierten Stream (kein `dynamic_cast`,
+  RTTI-frei) und lässt Baudrate **und Pins** unangetastet — entscheidend auf
+  ESP32 mit eigenen RX/TX-Pins. Der neue Overload
+  `begin(HardwareSerial&, baudRate)` hat **bewusst kein** Default-Argument,
+  damit `lidar.begin(Serial1)` nicht versehentlich die UART auf Default-Pins
+  neu startet.
+- **Korrektes Node-Parsing.** Die Signalqualität wird wieder aus den Bits 2–7
+  gelesen (vorher fälschlich `& 0x3F`). Der reine Decoder liegt jetzt in
+  `RPLidarParser.h` (ohne Arduino-Abhängigkeit) und ist host-getestet (`test/`,
+  Beispiel `ParserSelfTest`).
+- **Byte-Stream-Resynchronisierung** in `readMeasurement()`: ein 5-Byte-
+  Sliding-Window richtet sich bei ungültigen Nodes byteweise neu aus, statt
+  blind fünf Bytes zu lesen und so dauerhaft aus dem Takt zu geraten.
+- **Korrektes Parsen des Response-Descriptors.** Länge (30 Bit) und Send-Mode
+  (2 Bit) werden sauber getrennt (vorher floss das Typ-Byte in das Mode-Feld);
+  Descriptor-**Typ und Mindestlänge** werden für Scan/Info/Health/Sample-Rate
+  validiert.
+- **Robusterer `startScan()`.** Sendet SCAN, validiert den Descriptor und
+  bestätigt, dass tatsächlich Nodes eintreffen. Hängt/auto-scannt das Gerät,
+  wird automatisch ein `reset()` + genau ein erneuter Versuch ausgeführt. Das
+  frühere STOP/SCAN-„Churn" (an dem manche C1-Einheiten hängen blieben)
+  entfällt.
+- **`stop()` leert bis Ruhe** (`_drainUntilQuiet`), damit der nächste
+  Befehls-Descriptor auf einem sauberen Puffer beginnt. Info-/Health-/
+  Sample-Rate-Abfragen stoppen vorher automatisch einen laufenden Scan.
+- **`readFast()`** nutzt jetzt denselben validierten Pfad wie
+  `readMeasurement()` (vorher ungeprüftes Roh-Parsen ohne Check-Bit/Resync).
+- **Express-Scan** ist ehrlich als *nicht implementiert* markiert
+  (`startExpressScan()` → `false`), statt mis-dekodierte Messwerte zu liefern.
+- Kleinkram: Null-Pointer-Checks in den Custom-Command-/Raw-APIs, A3-Baudrate
+  (256000) ergänzt, durchgängig `-fno-rtti`-tauglich.
 
 ## Installation
 
@@ -72,7 +115,8 @@ Die richtige Baud-Rate ist **kritisch** für erfolgreiche Kommunikation:
 
 | Modell | Baud-Rate | Konstante |
 |--------|-----------|-----------|
-| A1M, A2, A3 | 115200 | `RPLIDAR_BAUD_A1M` |
+| A1M, A2 | 115200 | `RPLIDAR_BAUD_A1M` |
+| A3 | 256000 | `RPLIDAR_BAUD_A3` |
 | C1, C3 | 460800 | `RPLIDAR_BAUD_C1` |
 | S2, S2L, S3 | 1000000 | `RPLIDAR_BAUD_S2L` |
 
@@ -107,20 +151,21 @@ void loop() {
 
 ### Initialisierung
 
-#### `begin(Stream& serialObj, uint32_t baudRate)`
-Initialisiert die Kommunikation mit dem RPLidar.
+#### `begin(Stream& serialObj)`
+Bindet einen **bereits konfigurierten** Stream. Setzt **weder** Baudrate noch Pins
+(wichtig auf ESP32, wo eigene RX/TX-Pins nötig sind) und prüft nicht, ob ein Gerät
+antwortet — dafür `getHealth()`/`isConnected()` nutzen. Gibt `true` zurück.
 
-**Parameter:**
-- `serialObj`: Serial-Objekt (Serial, Serial1, Serial2, etc.)
-- `baudRate`: Baud-Rate entsprechend Ihrem Modell
-
-**Rückgabe:** `true` bei Erfolg
-
-**Beispiel:**
 ```cpp
-Serial2.begin(RPLIDAR_BAUD_S2L, SERIAL_8N1, 16, 17);
-lidar.begin(Serial2, RPLIDAR_BAUD_S2L);
+Serial1.begin(RPLIDAR_BAUD_C1, SERIAL_8N1, 7, 8);  // eigene Pins zuerst
+delay(1000);                                        // UART hochfahren lassen
+lidar.begin(Serial1);                               // dann binden
 ```
+
+#### `begin(HardwareSerial& serialObj, uint32_t baudRate = RPLIDAR_BAUD_A1M)`
+Komfort-Overload für Boards mit Default-UART-Pins: ruft `serialObj.begin(baudRate)`
+auf und bindet den Stream. Verwendet **kein** `dynamic_cast` (RTTI-frei). Auf ESP32
+mit eigenen RX/TX-Pins stattdessen die `begin(Stream&)`-Variante verwenden.
 
 ### Gerätekontrolle
 
@@ -134,7 +179,8 @@ Setzt das RPLidar zurück (Neustart).
 Startet Standard-Scan-Modus.
 
 #### `startExpressScan(uint8_t mode = 0)`
-Startet Express-Scan-Modus (höhere Abtastrate).
+**Nicht implementiert** — gibt immer `false` zurück. Der Express-Cabin-Decoder
+ist nicht vorhanden/verifiziert; nutzen Sie `startScan()` (Standard-Scan).
 
 #### `forceScan()`
 Startet Scan ohne Rotation Check (für Tests).
@@ -188,28 +234,21 @@ if (lidar.readMeasurement(measurement)) {
     Serial.print(" Distanz: ");
     Serial.print(measurement.distance);    // mm
     Serial.print(" Qualität: ");
-    Serial.print(measurement.quality);     // 0-255
+    Serial.print(measurement.quality);     // 0-63
     if (measurement.startBit) {
         Serial.println(" [NEUER SCAN]");
     }
 }
 ```
 
-#### `readFast(float& angle, float& distance)` ⚡
-**Optimierte Hochgeschwindigkeits-Funktion** für minimalen Overhead.
-Perfekt für S2L und UDP-Übertragung!
+#### `readFast(float& angle, float& distance)`
+Komfort-Variante, die nur Winkel und Distanz liefert. Delegiert intern an
+`readMeasurement()` — verwendet also denselben validierten Parser **inklusive**
+Check-Bit-Prüfung und Resynchronisierung (kein ungeprüftes Parsen mehr).
 
-**Vorteile:**
-- Nur Winkel und Distanz (keine Qualität, kein Start-Bit)
-- Inline-Parsing für maximale Geschwindigkeit
-- Keine Verzögerungen
-- Minimaler Speicher-Footprint
-
-**Beispiel:**
 ```cpp
 float angle, distance;
 if (lidar.readFast(angle, distance)) {
-    // Extrem schnell - ideal für Echtzeit-Verarbeitung
     sendViaUDP(angle, distance);
 }
 ```
@@ -257,11 +296,15 @@ Gibt empfohlene Baud-Rate für Modellname zurück.
 ```cpp
 struct RPLidarMeasurement {
     float angle;        // Winkel in Grad (0-360)
-    float distance;     // Distanz in mm
-    uint8_t quality;    // Signalqualität (0-255)
+    float distance;     // Distanz in mm (0 = ungültig / kein Echo)
+    uint8_t quality;    // Signalqualität (0-63)
     bool startBit;      // true wenn Start eines neuen Scans
 };
 ```
+
+> Hinweis: `RPLidarMeasurement` und der reine Decoder
+> `rplidarParseStandardNode()` sind in `src/RPLidarParser.h` definiert (ohne
+> Arduino-Abhängigkeit, damit host-testbar — siehe `test/`).
 
 ### RPLidarDeviceInfo
 
@@ -297,14 +340,18 @@ Grundlegende Scan-Funktionalität mit vollständiger Messdaten-Ausgabe.
 Zeigt alle Geräteinformationen, Gesundheitsstatus und Abtastraten.
 
 ### 3. UltraFastScan ⚡
-**Optimiert für S2L!** Zeigt maximale Performance mit `readFast()`.
-- Minimaler Overhead
+Zeigt hohen Durchsatz mit `readFast()`. Hinweis: `readFast()` delegiert seit
+1.1.0 an den **validierten** Parser (mit Check-Bit-Prüfung und Resync), liefert
+also geprüfte statt roher Werte. Die S2L-Hinweise unten sind nicht auf C1-
+Hardware verifiziert.
 - Batch-Verarbeitung
 - UDP-Übertragung (Beispiel)
 - Performance-Statistiken
 
 ### 4. ExpressScan
-Demonstriert Express-Scan-Modus mit höherer Abtastrate.
+Dokumentiert, dass Express-Scan **nicht implementiert** ist: zeigt den
+(erwarteten) `false`-Rückgabewert von `startExpressScan()` und verweist auf den
+Standard-Scan (`BasicScan`).
 
 ### 5. CustomCommand
 Zeigt wie man benutzerdefinierte Befehle sendet und Antworten liest.
@@ -453,9 +500,12 @@ Danach Arduino IDE neu starten.
 
 ## Version
 
-Version 1.0.0 - Erste Release
-- Alle Standard-Befehle implementiert
-- Ultra-schnelle `readFast()` Funktion
-- Optimiert für S2L
-- 5 vollständige Beispiele
-- Vollständige Dokumentation
+**Version 1.1.0** — Protokoll- und Robustheitsfixes (siehe
+[Behobene Probleme](#behobene-probleme-110)).
+- Korrektes Node- und Descriptor-Parsing, host-getesteter Parser
+- Byte-Stream-Resynchronisierung in `readMeasurement()`
+- `begin(Stream&)` bindet nur (RTTI-frei), `startScan()` mit Auto-Recovery
+- Express-Scan ehrlich als nicht implementiert markiert
+- Verifiziert auf RPLIDAR C1 an ESP32-S3
+
+Version 1.0.0 — Erste Release (vor den oben genannten Fixes).

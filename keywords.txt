@@ -12,6 +12,8 @@ RPLidarDeviceInfo	KEYWORD1
 RPLidarHealth	KEYWORD1
 RPLidarResponseDescriptor	KEYWORD1
 
+rplidarParseStandardNode	KEYWORD2
+
 #######################################
 # Methods and Functions (KEYWORD2)
 #######################################
@@ -60,6 +62,7 @@ RPLIDAR_STATUS_WARNING	LITERAL1
 RPLIDAR_STATUS_ERROR	LITERAL1
 
 RPLIDAR_BAUD_A1M	LITERAL1
+RPLIDAR_BAUD_A3	LITERAL1
 RPLIDAR_BAUD_C1	LITERAL1
 RPLIDAR_BAUD_C3	LITERAL1
 RPLIDAR_BAUD_S2	LITERAL1

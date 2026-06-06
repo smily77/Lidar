@@ -3,37 +3,50 @@
  */
 
 #include "RPLidar.h"
+#include <string.h>
 
-RPLidar::RPLidar() : _serial(nullptr), _isScanning(false), _currentScanMode(RPLIDAR_SCAN_MODE_STANDARD) {
+RPLidar::RPLidar()
+    : _serial(nullptr), _isScanning(false),
+      _currentScanMode(RPLIDAR_SCAN_MODE_STANDARD), _nodeLen(0) {
 }
 
-bool RPLidar::begin(Stream& serialObj, uint32_t baudRate) {
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
+
+bool RPLidar::begin(Stream& serialObj) {
     _serial = &serialObj;
+    _isScanning = false;
+    _nodeLen = 0;
 
-    // For HardwareSerial, set baud rate
-    HardwareSerial* hwSerial = dynamic_cast<HardwareSerial*>(_serial);
-    if (hwSerial) {
-        hwSerial->begin(baudRate);
-        delay(100);
-    }
-
+    // Only bind + clear the buffer here. We deliberately do NOT send STOP:
+    // some units (e.g. RPLIDAR C1) auto-scan on power-up, and stopping spins
+    // the motor down -- startScan() handles the stop/settle/scan sequence.
     flush();
-
-    // Stop any ongoing scan
-    stop();
-    delay(10);
-
     return true;
 }
+
+bool RPLidar::begin(HardwareSerial& serialObj, uint32_t baudRate) {
+    // static dispatch on HardwareSerial -> no dynamic_cast / no RTTI needed.
+    serialObj.begin(baudRate);
+    delay(100);
+    return begin(static_cast<Stream&>(serialObj));
+}
+
+// ---------------------------------------------------------------------------
+// Device control
+// ---------------------------------------------------------------------------
 
 bool RPLidar::stop() {
     if (!_serial) return false;
 
     bool result = _sendSimpleCommand(RPLIDAR_CMD_STOP);
     _isScanning = false;
+    _nodeLen = 0;
     delay(10);
-    flush();
-
+    // Discard any in-flight scan data so the next command's response
+    // descriptor is not preceded by scan bytes (which can contain A5/5A).
+    _drainUntilQuiet(30, 300);
     return result;
 }
 
@@ -42,256 +55,244 @@ bool RPLidar::reset() {
 
     bool result = _sendSimpleCommand(RPLIDAR_CMD_RESET);
     _isScanning = false;
-    delay(2000); // Wait for device to reset
-
+    _nodeLen = 0;
+    delay(2500); // Wait for device to reboot before it accepts new commands
     flush();
     return result;
 }
 
-bool RPLidar::startScan(uint8_t scanMode) {
-    if (!_serial) return false;
+// Send SCAN, validate the response descriptor, and confirm nodes start
+// flowing. Does NOT send STOP (stopping spins the motor down and some C1 units
+// wedge on STOP/SCAN churn).
+bool RPLidar::_tryStartScan() {
+    flush();
+    _nodeLen = 0;
+    if (!_sendSimpleCommand(RPLIDAR_CMD_SCAN)) return false;
 
-    stop();
-    delay(10);
+    RPLidarResponseDescriptor descriptor;
+    if (!_waitResponseHeader(descriptor, 1500)) return false;
+    if (descriptor.type != RPLIDAR_ANS_TYPE_MEASUREMENT) return false;
 
-    bool result = _sendSimpleCommand(RPLIDAR_CMD_SCAN);
-    if (result) {
-        _isScanning = true;
-        _currentScanMode = scanMode;
-    }
-
-    return result;
+    // Confirm measurement nodes actually arrive (motor up to speed).
+    return waitPoint(1500);
 }
 
-bool RPLidar::startExpressScan(uint8_t mode) {
+bool RPLidar::startScan(uint8_t scanMode) {
     if (!_serial) return false;
+    _currentScanMode = scanMode;
 
-    stop();
-    delay(10);
+    // First try a plain SCAN (works when the unit is in a clean state).
+    if (_tryStartScan()) { _isScanning = true; return true; }
 
-    uint8_t payload[5] = {0};
-    payload[0] = mode;
+    // Otherwise the unit may be wedged or auto-scanning without emitting a
+    // fresh descriptor. A RESET returns it to a known state; retry once.
+    reset();                 // RESET + reboot wait + flush
+    if (_tryStartScan()) { _isScanning = true; return true; }
 
-    bool result = _sendCommandWithPayload(RPLIDAR_CMD_EXPRESS_SCAN, payload, 5);
-    if (result) {
-        _isScanning = true;
-        _currentScanMode = RPLIDAR_SCAN_MODE_EXPRESS;
-    }
-
-    return result;
+    _isScanning = false;
+    return false;
 }
 
 bool RPLidar::forceScan() {
     if (!_serial) return false;
 
-    stop();
-    delay(10);
+    flush();
+    _nodeLen = 0;
 
-    bool result = _sendSimpleCommand(RPLIDAR_CMD_FORCE_SCAN);
-    if (result) {
-        _isScanning = true;
-    }
+    if (!_sendSimpleCommand(RPLIDAR_CMD_FORCE_SCAN)) return false;
 
-    return result;
+    RPLidarResponseDescriptor descriptor;
+    if (!_waitResponseHeader(descriptor, 2000)) return false;
+    if (descriptor.type != RPLIDAR_ANS_TYPE_MEASUREMENT) return false;
+
+    _isScanning = true;
+    _currentScanMode = RPLIDAR_SCAN_MODE_STANDARD;
+    return true;
 }
+
+bool RPLidar::startExpressScan(uint8_t /*mode*/) {
+    // NOT IMPLEMENTED.
+    //
+    // Express scan returns "capsuled"/"ultra-capsuled" payloads (start angle,
+    // delta-encoded cabins, checksums) that need a dedicated decoder. That
+    // decoder is not implemented here and could not be verified against the
+    // available hardware (RPLIDAR C1 uses standard scan). Returning false
+    // avoids handing the caller mis-decoded measurements.
+    //
+    // Use startScan() (standard scan) instead.
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Device information
+// ---------------------------------------------------------------------------
 
 bool RPLidar::getDeviceInfo(RPLidarDeviceInfo& info) {
     if (!_serial) return false;
+    if (_isScanning) stop();   // request/response commands must not run mid-scan
 
-    // Send GET_INFO command
-    if (!_sendSimpleCommand(RPLIDAR_CMD_GET_INFO)) {
-        return false;
-    }
+    if (!_sendSimpleCommand(RPLIDAR_CMD_GET_INFO)) return false;
 
-    // Wait for response descriptor
     RPLidarResponseDescriptor descriptor;
-    if (!_waitResponseHeader(descriptor, 1000)) {
+    if (!_waitResponseHeader(descriptor, 1000)) return false;
+    if (descriptor.type != RPLIDAR_ANS_TYPE_DEVINFO || descriptor.length < 20) {
         return false;
     }
 
-    // Check response type
-    if (descriptor.type != RPLIDAR_ANS_TYPE_DEVINFO) {
-        return false;
-    }
-
-    // Read device info (20 bytes)
     uint8_t buffer[20];
-    if (!_readResponseData(buffer, 20, 1000)) {
-        return false;
-    }
+    if (!_readResponseData(buffer, 20, 1000)) return false;
 
-    // Parse device info
     info.model = buffer[0];
     info.firmware_version = buffer[2] | (buffer[1] << 8);
     info.hardware_version = buffer[3];
     memcpy(info.serialNumber, &buffer[4], 16);
-
     return true;
 }
 
 bool RPLidar::getHealth(RPLidarHealth& health) {
     if (!_serial) return false;
+    if (_isScanning) stop();
 
-    // Send GET_HEALTH command
-    if (!_sendSimpleCommand(RPLIDAR_CMD_GET_HEALTH)) {
-        return false;
-    }
+    if (!_sendSimpleCommand(RPLIDAR_CMD_GET_HEALTH)) return false;
 
-    // Wait for response descriptor
     RPLidarResponseDescriptor descriptor;
-    if (!_waitResponseHeader(descriptor, 1000)) {
+    if (!_waitResponseHeader(descriptor, 1000)) return false;
+    if (descriptor.type != RPLIDAR_ANS_TYPE_DEVHEALTH || descriptor.length < 3) {
         return false;
     }
 
-    // Check response type
-    if (descriptor.type != RPLIDAR_ANS_TYPE_DEVHEALTH) {
-        return false;
-    }
-
-    // Read health data (3 bytes)
     uint8_t buffer[3];
-    if (!_readResponseData(buffer, 3, 1000)) {
-        return false;
-    }
+    if (!_readResponseData(buffer, 3, 1000)) return false;
 
-    // Parse health info
     health.status = buffer[0];
     health.error_code = buffer[1] | (buffer[2] << 8);
-
     return true;
 }
 
 bool RPLidar::getSampleRate(uint16_t& standard_rate, uint16_t& express_rate) {
     if (!_serial) return false;
+    if (_isScanning) stop();
 
-    // Send GET_SAMPLERATE command
-    if (!_sendSimpleCommand(RPLIDAR_CMD_GET_SAMPLERATE)) {
-        return false;
-    }
+    if (!_sendSimpleCommand(RPLIDAR_CMD_GET_SAMPLERATE)) return false;
 
-    // Wait for response descriptor
     RPLidarResponseDescriptor descriptor;
-    if (!_waitResponseHeader(descriptor, 1000)) {
+    if (!_waitResponseHeader(descriptor, 1000)) return false;
+    if (descriptor.type != RPLIDAR_ANS_TYPE_SAMPLE_RATE || descriptor.length < 4) {
         return false;
     }
 
-    // Read sample rate data (4 bytes)
     uint8_t buffer[4];
-    if (!_readResponseData(buffer, 4, 1000)) {
-        return false;
-    }
+    if (!_readResponseData(buffer, 4, 1000)) return false;
 
-    // Parse sample rate
     standard_rate = buffer[0] | (buffer[1] << 8);
     express_rate = buffer[2] | (buffer[3] << 8);
-
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Data reading
+// ---------------------------------------------------------------------------
 
 bool RPLidar::waitPoint(uint32_t timeout) {
     if (!_serial) return false;
 
     uint32_t startTime = millis();
     while (millis() - startTime < timeout) {
-        if (_serial->available() >= 5) {
-            return true;
-        }
+        if (_serial->available() >= 5) return true;
         delayMicroseconds(100);
     }
-
     return false;
 }
 
 bool RPLidar::readMeasurement(RPLidarMeasurement& measurement) {
     if (!_serial || !_isScanning) return false;
 
-    // Wait for at least 5 bytes (standard measurement packet)
-    if (!waitPoint(500)) {
-        return false;
+    uint32_t deadline = millis() + 500;
+    while ((int32_t)(millis() - deadline) < 0) {
+        // Top the sliding window up to a full 5-byte node.
+        while (_nodeLen < 5) {
+            if (_serial->available() > 0) {
+                _node[_nodeLen++] = (uint8_t)_serial->read();
+            } else if ((int32_t)(millis() - deadline) >= 0) {
+                return false;
+            }
+        }
+
+        if (rplidarParseStandardNode(_node, measurement)) {
+            _nodeLen = 0;     // node consumed
+            return true;
+        }
+
+        // Invalid node: drop the oldest byte and try to realign on the next.
+        _node[0] = _node[1];
+        _node[1] = _node[2];
+        _node[2] = _node[3];
+        _node[3] = _node[4];
+        _nodeLen = 4;
     }
-
-    // Read measurement data
-    uint8_t buffer[5];
-    buffer[0] = _serial->read();
-    buffer[1] = _serial->read();
-    buffer[2] = _serial->read();
-    buffer[3] = _serial->read();
-    buffer[4] = _serial->read();
-
-    return _parseMeasurementNode(buffer, measurement);
+    return false;
 }
 
 bool RPLidar::readFast(float& angle, float& distance) {
-    if (!_serial || !_isScanning) return false;
-
-    // Optimized for minimal overhead - inline reading and parsing
-    // Wait for data with minimal delay
-    uint32_t startTime = millis();
-    while (_serial->available() < 5) {
-        if (millis() - startTime > 500) return false;
-        // No delay - maximum speed
-    }
-
-    // Read bytes directly
-    uint8_t byte0 = _serial->read();
-    uint8_t byte1 = _serial->read();
-    uint8_t byte2 = _serial->read();
-    uint8_t byte3 = _serial->read();
-    uint8_t byte4 = _serial->read();
-
-    // Parse angle (inline for speed)
-    // Angle is in bytes 1-2: (byte2 >> 1) | (byte1 << 7)
-    uint16_t angle_raw = ((byte2 >> 1) | (byte1 << 7));
-    angle = angle_raw / 64.0f;
-
-    // Parse distance (inline for speed)
-    // Distance is in bytes 3-4
-    uint16_t distance_raw = byte3 | (byte4 << 8);
-    distance = distance_raw / 4.0f;
-
+    RPLidarMeasurement m;
+    if (!readMeasurement(m)) return false;
+    angle = m.angle;
+    distance = m.distance;
     return true;
 }
 
 bool RPLidar::readRawMeasurement(uint8_t* buffer, size_t length, uint32_t timeout) {
-    if (!_serial) return false;
+    if (!_serial || !buffer || length == 0) return false;
 
     uint32_t startTime = millis();
     size_t bytesRead = 0;
-
     while (bytesRead < length && (millis() - startTime < timeout)) {
         if (_serial->available() > 0) {
             buffer[bytesRead++] = _serial->read();
         }
     }
-
     return bytesRead == length;
 }
 
+// ---------------------------------------------------------------------------
+// Custom commands
+// ---------------------------------------------------------------------------
+
 bool RPLidar::sendCommand(uint8_t cmd, const uint8_t* payload, uint8_t payloadSize) {
+    if (payloadSize > 0 && payload == nullptr) return false;  // invalid args
     if (payloadSize == 0) {
         return _sendSimpleCommand(cmd);
-    } else {
-        return _sendCommandWithPayload(cmd, payload, payloadSize);
     }
+    return _sendCommandWithPayload(cmd, payload, payloadSize);
 }
 
 bool RPLidar::readResponse(uint8_t* buffer, size_t maxLength, uint32_t timeout) {
-    if (!_serial) return false;
+    if (!_serial || !buffer || maxLength == 0) return false;
 
-    // Wait for response descriptor
     RPLidarResponseDescriptor descriptor;
-    if (!_waitResponseHeader(descriptor, timeout)) {
-        return false;
-    }
+    if (!_waitResponseHeader(descriptor, timeout)) return false;
 
-    // Read response data
-    size_t bytesToRead = min(descriptor.length, (uint32_t)maxLength);
-    return _readResponseData(buffer, bytesToRead, timeout);
+    size_t toRead = (descriptor.length < (uint32_t)maxLength)
+                        ? (size_t)descriptor.length : maxLength;
+    if (!_readResponseData(buffer, toRead, timeout)) return false;
+
+    // Discard any response bytes that did not fit, so the stream stays aligned.
+    uint32_t startTime = millis();
+    for (uint32_t i = toRead; i < descriptor.length; i++) {
+        while (_serial->available() == 0) {
+            if (millis() - startTime > timeout) return false;
+        }
+        _serial->read();
+    }
+    return true;
 }
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
 void RPLidar::flush() {
     if (!_serial) return;
-
     while (_serial->available() > 0) {
         _serial->read();
     }
@@ -299,38 +300,34 @@ void RPLidar::flush() {
 
 bool RPLidar::isConnected() {
     if (!_serial) return false;
-
     RPLidarHealth health;
     return getHealth(health);
 }
 
 uint32_t RPLidar::getDefaultBaudRate(const char* model) {
-    if (strstr(model, "A1") || strstr(model, "A2") || strstr(model, "A3")) {
-        return RPLIDAR_BAUD_A1M;
-    } else if (strstr(model, "C1") || strstr(model, "C3")) {
-        return RPLIDAR_BAUD_C1;
-    } else if (strstr(model, "S2") || strstr(model, "S3")) {
-        return RPLIDAR_BAUD_S2;
-    }
+    if (!model) return RPLIDAR_BAUD_A1M;
+    if (strstr(model, "A3")) return RPLIDAR_BAUD_A3;                 // 256000
+    if (strstr(model, "A1") || strstr(model, "A2")) return RPLIDAR_BAUD_A1M;
+    if (strstr(model, "C1") || strstr(model, "C3")) return RPLIDAR_BAUD_C1;
+    if (strstr(model, "S2") || strstr(model, "S3")) return RPLIDAR_BAUD_S2;
     return RPLIDAR_BAUD_A1M; // Default
 }
 
-// Private methods
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
 
 bool RPLidar::_sendSimpleCommand(uint8_t cmd) {
     if (!_serial) return false;
-
     _serial->write(RPLIDAR_CMD_SYNC_BYTE);
     _serial->write(cmd);
     _serial->flush();
-
     return true;
 }
 
 bool RPLidar::_sendCommandWithPayload(uint8_t cmd, const uint8_t* payload, uint8_t payloadSize) {
     if (!_serial) return false;
 
-    // Calculate checksum
     uint8_t checksum = 0;
     checksum ^= RPLIDAR_CMD_SYNC_BYTE;
     checksum ^= cmd;
@@ -339,14 +336,12 @@ bool RPLidar::_sendCommandWithPayload(uint8_t cmd, const uint8_t* payload, uint8
         checksum ^= payload[i];
     }
 
-    // Send command packet
     _serial->write(RPLIDAR_CMD_SYNC_BYTE);
     _serial->write(cmd);
     _serial->write(payloadSize);
     _serial->write(payload, payloadSize);
     _serial->write(checksum);
     _serial->flush();
-
     return true;
 }
 
@@ -355,48 +350,58 @@ bool RPLidar::_waitResponseHeader(RPLidarResponseDescriptor& descriptor, uint32_
 
     uint32_t startTime = millis();
 
-    // Wait for start bytes
+    // Find the two start bytes (A5 5A), tolerating leading garbage.
     while (millis() - startTime < timeout) {
-        if (_serial->available() < 2) {
-            delayMicroseconds(100);
-            continue;
-        }
+        if (_serial->available() < 1) { delayMicroseconds(100); continue; }
 
-        uint8_t byte1 = _serial->read();
-        if (byte1 != RPLIDAR_ANS_SYNC_BYTE1) {
-            continue;
-        }
+        if ((uint8_t)_serial->read() != RPLIDAR_ANS_SYNC_BYTE1) continue;
 
-        uint8_t byte2 = _serial->read();
-        if (byte2 != RPLIDAR_ANS_SYNC_BYTE2) {
-            continue;
-        }
-
-        // Read descriptor (5 bytes remaining)
-        uint32_t descStartTime = millis();
-        while (_serial->available() < 5 && (millis() - descStartTime < 100)) {
+        // Wait for the second sync byte.
+        while (_serial->available() < 1) {
+            if (millis() - startTime >= timeout) return false;
             delayMicroseconds(100);
         }
-
-        if (_serial->available() < 5) {
-            return false;
+        if ((uint8_t)_serial->read() != RPLIDAR_ANS_SYNC_BYTE2) {
+            // Not a real header; keep scanning for the next A5.
+            continue;
         }
 
+        // Read the 5-byte descriptor body.
         uint8_t descBuffer[5];
-        for (int i = 0; i < 5; i++) {
-            descBuffer[i] = _serial->read();
+        uint32_t descStart = millis();
+        int got = 0;
+        while (got < 5) {
+            if (_serial->available() > 0) {
+                descBuffer[got++] = (uint8_t)_serial->read();
+            } else if (millis() - descStart > 100) {
+                return false;
+            }
         }
 
-        // Parse descriptor
-        descriptor.length = descBuffer[0] | (descBuffer[1] << 8) | (descBuffer[2] << 16) | (descBuffer[3] << 24);
-        descriptor.length &= 0x3FFFFFFF; // 30-bit length
-        descriptor.mode = (descBuffer[3] >> 6) | ((descBuffer[4] & 0x03) << 2);
+        // 32-bit field: bits[0..29] length, bits[30..31] send mode; +1 type byte.
+        descriptor.length = (uint32_t)descBuffer[0]
+                          | ((uint32_t)descBuffer[1] << 8)
+                          | ((uint32_t)descBuffer[2] << 16)
+                          | ((uint32_t)(descBuffer[3] & 0x3F) << 24);
+        descriptor.mode = (uint8_t)(descBuffer[3] >> 6);
         descriptor.type = descBuffer[4];
-
         return true;
     }
-
     return false;
+}
+
+void RPLidar::_drainUntilQuiet(uint32_t quietMs, uint32_t capMs) {
+    if (!_serial) return;
+    uint32_t cap = millis() + capMs;
+    uint32_t lastByte = millis();
+    while ((int32_t)(millis() - cap) < 0) {
+        if (_serial->available() > 0) {
+            _serial->read();
+            lastByte = millis();
+        } else if (millis() - lastByte >= quietMs) {
+            break;
+        }
+    }
 }
 
 bool RPLidar::_readResponseData(uint8_t* buffer, size_t length, uint32_t timeout) {
@@ -404,7 +409,6 @@ bool RPLidar::_readResponseData(uint8_t* buffer, size_t length, uint32_t timeout
 
     uint32_t startTime = millis();
     size_t bytesRead = 0;
-
     while (bytesRead < length && (millis() - startTime < timeout)) {
         if (_serial->available() > 0) {
             buffer[bytesRead++] = _serial->read();
@@ -412,40 +416,5 @@ bool RPLidar::_readResponseData(uint8_t* buffer, size_t length, uint32_t timeout
             delayMicroseconds(100);
         }
     }
-
     return bytesRead == length;
-}
-
-inline bool RPLidar::_parseMeasurementNode(const uint8_t* buffer, RPLidarMeasurement& measurement) {
-    // Parse standard scan measurement packet (5 bytes)
-    // Byte 0: [S(1bit)][!S(1bit)][Quality(6bits)]
-    // Byte 1-2: [C(1bit)][Angle_q6(15bits)]
-    // Byte 3-4: [Distance_q2(16bits)]
-
-    uint8_t quality = buffer[0] & 0x3F;
-    bool startBit = (buffer[0] & 0x01) != 0;
-    bool checkBit = (buffer[1] & 0x01) != 0;
-
-    // Check bit validation
-    if (checkBit != ((buffer[0] & 0x01) ^ 0x01)) {
-        return false;
-    }
-
-    uint16_t angle_q6 = ((buffer[2] >> 1) | (buffer[1] << 7)) & 0x7FFF;
-    uint16_t distance_q2 = buffer[3] | (buffer[4] << 8);
-
-    measurement.quality = quality;
-    measurement.startBit = startBit;
-    measurement.angle = angle_q6 / 64.0f;
-    measurement.distance = distance_q2 / 4.0f;
-
-    return true;
-}
-
-uint8_t RPLidar::_calculateChecksum(const uint8_t* data, size_t length) {
-    uint8_t checksum = 0;
-    for (size_t i = 0; i < length; i++) {
-        checksum ^= data[i];
-    }
-    return checksum;
 }

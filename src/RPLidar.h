@@ -1,22 +1,24 @@
 /*
  * RPLidar.h - Arduino library for Slamtec RPLidar laser scanner
  *
- * Supports: A1M, C1, C3, S2, S2L, S3 and compatible models
+ * Tested: RPLIDAR C1 on ESP32-S3 (standard scan, 460800 baud).
+ * Standard scan, device info/health and sample-rate queries are implemented
+ * and protocol-correct. Express scan is NOT implemented (see startExpressScan).
  *
  * Features:
- * - All standard RPLidar commands
- * - Optimized high-speed data reading (minimal overhead)
+ * - Standard scan with byte-stream resynchronisation
+ * - Device info / health / sample-rate queries with descriptor validation
  * - Custom command support
- * - Express scan mode support
+ * - No RTTI dependency (builds with -fno-rtti)
  *
- * Author: RPLidar Arduino Library
- * License: MIT
+ * License: MIT (see LICENSE)
  */
 
 #ifndef RPLIDAR_H
 #define RPLIDAR_H
 
 #include <Arduino.h>
+#include "RPLidarParser.h"   // RPLidarMeasurement + pure node decoder
 
 // RPLidar Protocol Constants
 #define RPLIDAR_CMD_SYNC_BYTE           0xA5
@@ -54,19 +56,12 @@
 
 // Standard baud rates for different models
 #define RPLIDAR_BAUD_A1M                115200
+#define RPLIDAR_BAUD_A3                 256000
 #define RPLIDAR_BAUD_C1                 460800
 #define RPLIDAR_BAUD_C3                 460800
 #define RPLIDAR_BAUD_S2                 1000000
 #define RPLIDAR_BAUD_S2L                1000000
 #define RPLIDAR_BAUD_S3                 1000000
-
-// Measurement data structure (optimized for minimal overhead)
-struct RPLidarMeasurement {
-    float angle;        // Angle in degrees (0-360)
-    float distance;     // Distance in millimeters
-    uint8_t quality;    // Signal quality (0-255)
-    bool startBit;      // True if this is the start of a new scan
-};
 
 // Device information structure
 struct RPLidarDeviceInfo {
@@ -84,24 +79,36 @@ struct RPLidarHealth {
 
 // Response descriptor structure
 struct RPLidarResponseDescriptor {
-    uint32_t length;
-    uint8_t mode;
-    uint8_t type;
+    uint32_t length;   // expected response data length (30-bit)
+    uint8_t mode;      // send mode (0 = single, 1 = multiple)
+    uint8_t type;      // data type
 };
 
 class RPLidar {
 public:
-    // Constructor
     RPLidar();
 
-    // Initialization
-    bool begin(Stream& serialObj, uint32_t baudRate = RPLIDAR_BAUD_A1M);
+    // Initialization.
+    // begin(Stream&) only binds an already-configured stream (does NOT touch
+    // the baud rate or pins) and returns true. Use this on ESP32 after calling
+    // Serial1.begin(baud, SERIAL_8N1, rx, tx) yourself. It does not verify the
+    // device is present -- call getHealth()/isConnected() for that.
+    bool begin(Stream& serialObj);
+
+    // Convenience overload for boards where the library may configure the UART:
+    // calls serialObj.begin(baudRate) then binds it. Avoids dynamic_cast/RTTI.
+    // NOTE: baudRate is intentionally NOT defaulted. With a default argument,
+    // begin(Serial1) (one arg) would resolve to THIS overload (HardwareSerial&
+    // is a better match than Stream&) and silently re-begin the UART at the
+    // default baud on default pins. Requiring two args keeps begin(Serial1)
+    // bound to the begin(Stream&) overload.
+    bool begin(HardwareSerial& serialObj, uint32_t baudRate);
 
     // Device control commands
     bool stop();
     bool reset();
     bool startScan(uint8_t scanMode = RPLIDAR_SCAN_MODE_STANDARD);
-    bool startExpressScan(uint8_t mode = 0);
+    bool startExpressScan(uint8_t mode = 0);  // NOT IMPLEMENTED -> returns false
     bool forceScan();
 
     // Device information commands
@@ -111,11 +118,9 @@ public:
 
     // Data reading functions
     bool waitPoint(uint32_t timeout = 1000);
-    bool readMeasurement(RPLidarMeasurement& measurement);
+    bool readMeasurement(RPLidarMeasurement& measurement);  // validates + resyncs
 
-    // Optimized high-speed reading (minimal overhead - only distance and angle)
-    // Returns: true if data read successfully
-    // This function is optimized for ESP32 with S2L high data rate
+    // Convenience: angle + distance only (delegates to readMeasurement).
     bool readFast(float& angle, float& distance);
 
     // Raw data reading for custom processing
@@ -135,17 +140,20 @@ private:
     bool _isScanning;
     uint8_t _currentScanMode;
 
+    uint8_t _node[5];      // sliding window for measurement resynchronisation
+    uint8_t _nodeLen;      // bytes currently buffered in _node
+
     // Internal communication functions
     bool _sendSimpleCommand(uint8_t cmd);
     bool _sendCommandWithPayload(uint8_t cmd, const uint8_t* payload, uint8_t payloadSize);
+    bool _tryStartScan();   // single SCAN attempt: send + validate descriptor + confirm data
     bool _waitResponseHeader(RPLidarResponseDescriptor& descriptor, uint32_t timeout);
     bool _readResponseData(uint8_t* buffer, size_t length, uint32_t timeout);
 
-    // Fast inline parsing for optimized reading
-    inline bool _parseMeasurementNode(const uint8_t* buffer, RPLidarMeasurement& measurement);
-
-    // Checksum calculation
-    uint8_t _calculateChecksum(const uint8_t* data, size_t length);
+    // Drain RX until no byte arrives for quietMs (cap at capMs). Used after
+    // STOP to discard any in-flight scan data before the next command, so the
+    // following response descriptor starts on a clean buffer.
+    void _drainUntilQuiet(uint32_t quietMs, uint32_t capMs);
 };
 
 #endif // RPLIDAR_H
