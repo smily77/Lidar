@@ -1,146 +1,68 @@
 /*
- * BasicScan.ino - Basic RPLidar scanning example
+ * BasicScan.ino - Basic RPLidar standard-scan example
  *
- * This example demonstrates basic scanning functionality with RPLidar.
- * It continuously reads measurements and prints them to the Serial Monitor.
+ * Continuously reads measurements and prints them to the Serial Monitor.
  *
- * Hardware connections (ESP32 example):
- * - RPLidar TX -> ESP32 RX (e.g., GPIO 16)
- * - RPLidar RX -> ESP32 TX (e.g., GPIO 17)
- * - RPLidar 5V -> ESP32 5V
- * - RPLidar GND -> ESP32 GND
- * - RPLidar MOTOR_PWM -> ESP32 PWM pin (optional, for motor control)
+ * Wiring (RPLidar <-> MCU): Lidar TX -> MCU RX, Lidar RX -> MCU TX, plus 5V/GND.
  *
- * Author: RPLidar Arduino Library
+ * Set LIDAR_BAUD to match your model: A1M 115200, A3 256000, C1/C3 460800,
+ * S-series 1000000.
  */
 
 #include <RPLidar.h>
 
-// Create RPLidar object
 RPLidar lidar;
 
-// Serial port for RPLidar (ESP32 example)
-// For other boards, use the appropriate Serial port
-#define RPLIDAR_SERIAL Serial2
+#define LIDAR_BAUD 460800   // RPLIDAR C1 default
 
-// RX/TX pins for ESP32
-#define RPLIDAR_RX 16
-#define RPLIDAR_TX 17
-
-// Baud rate - change according to your model:
-// A1M: 115200
-// C1/C3: 460800
-// S2/S2L/S3: 1000000
-#define RPLIDAR_BAUD 115200
-
-void setup() {
-    // Initialize Serial for debugging
-    Serial.begin(115200);
-    while (!Serial) {
-        ; // Wait for Serial port to connect
-    }
-
-    Serial.println("RPLidar Basic Scan Example");
-    Serial.println("============================");
-
-    // Initialize RPLidar serial port
-#ifdef ESP32
-    // For ESP32, specify RX/TX pins
-    Serial2.begin(RPLIDAR_BAUD, SERIAL_8N1, RPLIDAR_RX, RPLIDAR_TX);
+// ---- Portable hardware-serial selection ------------------------------------
+#if defined(ESP32)
+  #define LIDAR_SERIAL  Serial1
+  #define LIDAR_RX      7
+  #define LIDAR_TX      8
+  #define LIDAR_UART_BEGIN()  Serial1.begin(LIDAR_BAUD, SERIAL_8N1, LIDAR_RX, LIDAR_TX)
+#elif defined(HAVE_HWSERIAL1) || defined(__AVR_ATmega2560__) || defined(ARDUINO_AVR_MEGA2560)
+  #define LIDAR_SERIAL  Serial1
+  #define LIDAR_UART_BEGIN()  Serial1.begin(LIDAR_BAUD)
 #else
-    // For other boards, use default pins
-    RPLIDAR_SERIAL.begin(RPLIDAR_BAUD);
+  #warning "No dedicated second UART for this board; using Serial (shared with USB). Edit LIDAR_SERIAL for your board."
+  #define LIDAR_SERIAL  Serial
+  #define LIDAR_UART_BEGIN()  Serial.begin(LIDAR_BAUD)
 #endif
 
-    // Initialize RPLidar
-    if (!lidar.begin(RPLIDAR_SERIAL, RPLIDAR_BAUD)) {
-        Serial.println("Failed to initialize RPLidar!");
-        while (1);
-    }
+void setup() {
+    Serial.begin(115200);
 
-    Serial.println("RPLidar initialized successfully!");
+    LIDAR_UART_BEGIN();
+    delay(1000);                 // give the lidar UART time to come up
+    lidar.begin(LIDAR_SERIAL);   // bind the already-configured stream
 
-    // Get device information
-    RPLidarDeviceInfo info;
-    if (lidar.getDeviceInfo(info)) {
-        Serial.println("\nDevice Information:");
-        Serial.print("Model: ");
-        Serial.println(info.model);
-        Serial.print("Firmware Version: ");
-        Serial.println(info.firmware_version);
-        Serial.print("Hardware Version: ");
-        Serial.println(info.hardware_version);
-        Serial.print("Serial Number: ");
-        for (int i = 0; i < 16; i++) {
-            Serial.print(info.serialNumber[i], HEX);
-        }
-        Serial.println();
-    }
-
-    // Check device health
     RPLidarHealth health;
     if (lidar.getHealth(health)) {
-        Serial.println("\nDevice Health:");
-        Serial.print("Status: ");
-        switch (health.status) {
-            case RPLIDAR_STATUS_OK:
-                Serial.println("OK");
-                break;
-            case RPLIDAR_STATUS_WARNING:
-                Serial.println("WARNING");
-                break;
-            case RPLIDAR_STATUS_ERROR:
-                Serial.println("ERROR");
-                break;
-            default:
-                Serial.println("Unknown");
-        }
-        if (health.error_code != 0) {
-            Serial.print("Error Code: ");
-            Serial.println(health.error_code);
-        }
-    }
-
-    // Start scanning
-    Serial.println("\nStarting scan...");
-    if (lidar.startScan()) {
-        Serial.println("Scan started successfully!");
-        Serial.println("\nFormat: Angle | Distance | Quality | NewScan");
-        Serial.println("-----------------------------------------------");
+        Serial.print("Health status: ");
+        Serial.println(health.status == RPLIDAR_STATUS_OK ? "OK" :
+                       health.status == RPLIDAR_STATUS_WARNING ? "WARNING" : "ERROR");
     } else {
-        Serial.println("Failed to start scan!");
-        while (1);
+        Serial.println("Could not read health (check baud rate / wiring).");
     }
 
-    delay(1000);
+    if (!lidar.startScan()) {
+        Serial.println("Failed to start scan!");
+        while (1) { delay(1000); }
+    }
+    Serial.println("Angle | Distance | Quality | NewScan");
 }
 
 void loop() {
-    // Read measurement
-    RPLidarMeasurement measurement;
-
-    if (lidar.readMeasurement(measurement)) {
-        // Print measurement
-        if (measurement.startBit) {
-            Serial.println(); // New scan marker
-        }
-
-        Serial.print(measurement.angle, 2);
+    RPLidarMeasurement m;
+    if (lidar.readMeasurement(m)) {
+        if (m.startBit) Serial.println("--- new scan ---");
+        Serial.print(m.angle, 2);
         Serial.print(" | ");
-        Serial.print(measurement.distance, 2);
+        Serial.print(m.distance, 2);
         Serial.print(" | ");
-        Serial.print(measurement.quality);
+        Serial.print(m.quality);
         Serial.print(" | ");
-        Serial.println(measurement.startBit ? "START" : "");
-
-        // Optional: Filter out low quality measurements
-        // if (measurement.quality < 10) {
-        //     return; // Skip low quality points
-        // }
-
-        // Optional: Filter by angle range
-        // if (measurement.angle < 45 || measurement.angle > 135) {
-        //     return; // Only show front quadrant
-        // }
+        Serial.println(m.startBit ? "START" : "");
     }
 }

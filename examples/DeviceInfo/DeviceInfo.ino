@@ -18,18 +18,22 @@
 // Create RPLidar object
 RPLidar lidar;
 
-// Serial port for RPLidar
-#define RPLIDAR_SERIAL Serial2
-
-// RX/TX pins for ESP32
-#define RPLIDAR_RX 16
-#define RPLIDAR_TX 17
-
 // Baud rate - change according to your model:
-// A1M: 115200
-// C1/C3: 460800
-// S2/S2L/S3: 1000000
-#define RPLIDAR_BAUD 115200
+// A1M: 115200, A3: 256000, C1/C3: 460800, S2/S2L/S3: 1000000
+#define RPLIDAR_BAUD 460800
+
+// ---- Portable hardware-serial selection ------------------------------------
+#if defined(ESP32)
+  #define RPLIDAR_SERIAL  Serial1
+  #define LIDAR_UART_BEGIN()  Serial1.begin(RPLIDAR_BAUD, SERIAL_8N1, 7, 8)
+#elif defined(HAVE_HWSERIAL1) || defined(__AVR_ATmega2560__) || defined(ARDUINO_AVR_MEGA2560)
+  #define RPLIDAR_SERIAL  Serial1
+  #define LIDAR_UART_BEGIN()  Serial1.begin(RPLIDAR_BAUD)
+#else
+  #warning "No dedicated second UART for this board; using Serial (shared with USB)."
+  #define RPLIDAR_SERIAL  Serial
+  #define LIDAR_UART_BEGIN()  Serial.begin(RPLIDAR_BAUD)
+#endif
 
 void setup() {
     // Initialize Serial for debugging
@@ -42,22 +46,11 @@ void setup() {
     Serial.println("===================================");
     Serial.println();
 
-    // Initialize RPLidar serial port
-#ifdef ESP32
-    // For ESP32, specify RX/TX pins
-    Serial2.begin(RPLIDAR_BAUD, SERIAL_8N1, RPLIDAR_RX, RPLIDAR_TX);
-#else
-    // For other boards, use default pins
-    RPLIDAR_SERIAL.begin(RPLIDAR_BAUD);
-#endif
-
-    // Initialize RPLidar
-    Serial.print("Initializing RPLidar...");
-    if (!lidar.begin(RPLIDAR_SERIAL, RPLIDAR_BAUD)) {
-        Serial.println(" FAILED!");
-        while (1);
-    }
-    Serial.println(" OK!");
+    // Initialize the lidar UART, then bind it.
+    LIDAR_UART_BEGIN();
+    delay(1000);                 // give the lidar UART time to come up
+    lidar.begin(RPLIDAR_SERIAL); // bind the already-configured stream
+    Serial.println("Initialized.");
 
     // Get and display device information
     displayDeviceInfo();

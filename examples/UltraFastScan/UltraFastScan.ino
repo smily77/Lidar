@@ -33,15 +33,21 @@
 // Create RPLidar object
 RPLidar lidar;
 
-// Serial port for RPLidar (must use hardware serial for high speed)
-#define RPLIDAR_SERIAL Serial2
-
-// RX/TX pins for ESP32
-#define RPLIDAR_RX 16
-#define RPLIDAR_TX 17
-
-// S2L uses 1000000 baud
+// S2L uses 1000000 baud (this example targets high-rate models)
 #define RPLIDAR_BAUD 1000000
+
+// ---- Portable hardware-serial selection (high speed needs a hardware UART) --
+#if defined(ESP32)
+  #define RPLIDAR_SERIAL  Serial1
+  #define LIDAR_UART_BEGIN()  do { Serial1.setRxBufferSize(2048); Serial1.begin(RPLIDAR_BAUD, SERIAL_8N1, 7, 8); } while (0)
+#elif defined(HAVE_HWSERIAL1) || defined(__AVR_ATmega2560__) || defined(ARDUINO_AVR_MEGA2560)
+  #define RPLIDAR_SERIAL  Serial1
+  #define LIDAR_UART_BEGIN()  Serial1.begin(RPLIDAR_BAUD)
+#else
+  #warning "No dedicated second UART for this board; using Serial (shared with USB)."
+  #define RPLIDAR_SERIAL  Serial
+  #define LIDAR_UART_BEGIN()  Serial.begin(RPLIDAR_BAUD)
+#endif
 
 // Statistics
 unsigned long measurementCount = 0;
@@ -79,30 +85,17 @@ void setup() {
     // Optional: Initialize WiFi for UDP
     // setupWiFi();
 
-    // Initialize RPLidar serial port at high speed
-#ifdef ESP32
-    Serial2.begin(RPLIDAR_BAUD, SERIAL_8N1, RPLIDAR_RX, RPLIDAR_TX);
-
-    // Increase serial buffer size for high-speed data
-    Serial2.setRxBufferSize(2048);
-
-    Serial.println("ESP32 configuration:");
-    Serial.println("- Serial buffer increased to 2048 bytes");
+    // Initialize the lidar UART at high speed, then bind it.
+    LIDAR_UART_BEGIN();
+    delay(1000);                 // give the lidar UART time to come up
+    lidar.begin(RPLIDAR_SERIAL); // bind the already-configured stream
+#if defined(ESP32)
     Serial.println("- CPU frequency: " + String(ESP.getCpuFreqMHz()) + " MHz");
     if (ESP.getCpuFreqMHz() < 240) {
-        Serial.println("WARNING: Consider setting CPU frequency to 240 MHz for best performance");
+        Serial.println("WARNING: set CPU frequency to 240 MHz for best performance");
     }
-#else
-    RPLIDAR_SERIAL.begin(RPLIDAR_BAUD);
 #endif
-
-    // Initialize RPLidar
-    Serial.print("Initializing RPLidar...");
-    if (!lidar.begin(RPLIDAR_SERIAL, RPLIDAR_BAUD)) {
-        Serial.println(" FAILED!");
-        while (1);
-    }
-    Serial.println(" OK!");
+    Serial.println("Initialized.");
 
     // Quick health check
     RPLidarHealth health;
